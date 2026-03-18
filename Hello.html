@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI Ping Pong - TF.js</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+    <style>
+        body {
+            margin: 0; padding: 0; background-color: #1a1a1a; overflow: hidden;
+            touch-action: none; user-select: none; font-family: Arial, sans-serif;
+            color: white;
+        }
+        canvas { display: block; }
+
+        /* Touch Zones */
+        .touch-zone {
+            position: absolute; width: 100%; height: 12vh; 
+            background: rgba(255, 255, 255, 0.03); box-sizing: border-box;
+            display: flex; align-items: center; justify-content: center; pointer-events: none;
+        }
+        .touch-zone.active { pointer-events: auto; }
+        .touch-zone::after {
+            content: ''; width: 90%; height: 4px; background: rgba(255, 255, 255, 0.1); border-radius: 2px;
+        }
+        .top-zone { top: 0; border-bottom: 2px solid rgba(255, 255, 255, 0.1); }
+        .bottom-zone { bottom: 0; border-top: 2px solid rgba(255, 255, 255, 0.1); }
+
+        /* Score Display */
+        #score-board {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: rgba(255, 255, 255, 0.1); font-size: 80px; font-weight: bold;
+            pointer-events: none; text-align: center; width: 100%; z-index: 1;
+        }
+
+        /* Menu UI */
+        #menu {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.85); display: flex; flex-direction: column;
+            align-items: center; justify-content: center; z-index: 10;
+        }
+        .menu-box {
+            background: #2c3e50; padding: 30px; border-radius: 12px; text-align: center;
+            width: 80%; max-width: 350px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+        h1 { margin-top: 0; font-size: 24px; }
+        button {
+            width: 100%; padding: 15px; margin: 10px 0; font-size: 18px; font-weight: bold;
+            border: none; border-radius: 8px; cursor: pointer; color: white;
+        }
+        .btn-blue { background: #3498db; }
+        .btn-red { background: #e74c3c; }
+        .btn-green { background: #2ecc71; }
+        .btn-gray { background: #7f8c8d; opacity: 0.5; pointer-events: none; }
+        
+        #ai-status { font-size: 14px; margin-top: 10px; color: #f1c40f; height: 20px; }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+
+    <div id="menu">
+        <div class="menu-box" id="main-panel">
+            <h1>Ping Pong Modes</h1>
+            <button class="btn-blue" onclick="startHumanVsHuman()">2 Players (Human)</button>
+            <button class="btn-red" onclick="showAIPanel()">Play vs AI</button>
+        </div>
+
+        <div class="menu-box hidden" id="ai-panel">
+            <h1>AI Lab (TF.js)</h1>
+            <button class="btn-blue" onclick="trainAI()" id="btn-train">1. Train AI Network</button>
+            <button class="btn-gray" onclick="startAIvsHuman()" id="btn-test">2. Test AI (Play)</button>
+            <button class="btn-red" onclick="showMainPanel()" style="margin-top: 30px;">Back</button>
+            <div id="ai-status">AI Status: Untrained</div>
+        </div>
+    </div>
+
+    <div id="score-board">
+        <div id="score2">0</div>
+        <div style="height: 20px;"></div>
+        <div id="score1">0</div>
+    </div>
+    
+    <div id="p2-zone" class="touch-zone top-zone active"></div>
+    <canvas id="gameCanvas"></canvas>
+    <div id="p1-zone" class="touch-zone bottom-zone active"></div>
+
+    <script>
+        // --- 1. SETUP & STATE ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        let gameMode = 'menu'; // 'pvh' (Player vs Human) or 'pva' (Player vs AI)
+        let animationId;
+        
+        const paddleWidth = 100;
+        const paddleHeight = 15;
+        const initialBallSpeed = 6000000;
+
+        const p1 = { x: 0, y: 0, width: paddleWidth, height: paddleHeight, score: 0, color: '#3498db' };
+        const p2 = { x: 0, y: 0, width: paddleWidth, height: paddleHeight, score: 0, color: '#e74c3c' };
+        const ball = { x: 0, y: 0, radius: 10, dx: 4, dy: initialBallSpeed, color: '#fff' };
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            p1.y = canvas.height - (window.innerHeight * 0.12) - 15; 
+            p2.y = (window.innerHeight * 0.12);
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // --- 2. TENSORFLOW.JS AI LOGIC ---
+        let model;
+        let aiTrained = false;
+        let aiTargetX = canvas.width / 2;
+
+        // Build the Neural Network
+        function initModel() {
+            model = tf.sequential();
+            // Inputs: ball_x, ball_y, ball_dx, ball_dy (Normalized)
+            model.add(tf.layers.dense({ units: 16, inputShape: [4], activation: 'relu' }));
+            model.add(tf.layers.dense({ units: 16, activation: 'relu' }));
+            // Output: Predicted ideal paddle X center (Normalized)
+            model.add(tf.layers.dense({ units: 1, activation: 'linear' }));
+            model.compile({ optimizer: tf.train.adam(0.01), loss: 'meanSquaredError' });
+        }
+
+        async function trainAI() {
+            if (!model) initModel();
+            
+            const statusText = document.getElementById('ai-status');
+            const btnTrain = document.getElementById('btn-train');
+            btnTrain.disabled = true;
+            btnTrain.classList.replace('btn-blue', 'btn-gray');
+            statusText.innerText = "Generating Training Data...";
+
+            // Create synthetic training data (Teaching it the math to intercept)
+            const numSamples = 2000;
+            const inputs = [];
+            const outputs = [];
+
+            for (let i = 0; i < numSamples; i++) {
+                let bx = Math.random() * canvas.width;
+                let by = (Math.random() * 0.5 + 0.2) * canvas.height; // Ball in middle area
+                let bdx = (Math.random() > 0.5 ? 1 : -1) * (3 + Math.random() * 5);
+                let bdy = -1 * (4 + Math.random() * 5); // Ball moving towards AI (top)
+
+                // Calculate where it will hit the top paddle line
+                let timeToHit = (by - p2.y) / Math.abs(bdy);
+                let interceptX = bx + (bdx * timeToHit);
+
+                // Handle basic wall bounces in prediction
+                while (interceptX < 0 || interceptX > canvas.width) {
+                    if (interceptX < 0) interceptX = Math.abs(interceptX);
+                    if (interceptX > canvas.width) interceptX = canvas.width - (interceptX - canvas.width);
+                }
+
+                // Normalize data between 0 and 1 for the Neural Network
+                inputs.push([bx / canvas.width, by / canvas.height, bdx / 10, bdy / 10]);
+                outputs.push([interceptX / canvas.width]);
+            }
+
+            const xs = tf.tensor2d(inputs);
+            const ys = tf.tensor2d(outputs);
+
+            // Train the model
+            await model.fit(xs, ys, {
+                epochs: 20,
+                shuffle: true,
+                callbacks: {
+                    onEpochEnd: (epoch, logs) => {
+                        statusText.innerText = `Training... Epoch ${epoch + 1}/20 (Loss: ${logs.loss.toFixed(4)})`;
+                    }
+                }
+            });
+
+            // Cleanup memory
+            xs.dispose();
+            ys.dispose();
+
+            aiTrained = true;
+            statusText.innerText = "Training Complete! AI Ready.";
+            statusText.style.color = "#2ecc71";
+            
+            // Enable Test Button
+            const btnTest = document.getElementById('btn-test');
+            btnTest.classList.replace('btn-gray', 'btn-green');
+            btnTest.style.pointerEvents = 'auto';
+            btnTrain.innerText = "Retrain AI";
+            btnTrain.classList.replace('btn-gray', 'btn-blue');
+            btnTrain.disabled = false;
+        }
+
+        // Run prediction during the game
+        function getAIPrediction() {
+            if (!aiTrained || ball.dy > 0) { 
+                // If ball is moving away, go to center
+                return canvas.width / 2; 
+            }
+
+            // tf.tidy cleans up the memory automatically after prediction
+            return tf.tidy(() => {
+                const input = tf.tensor2d([[
+                    ball.x / canvas.width, 
+                    ball.y / canvas.height, 
+                    ball.dx / 10, 
+                    ball.dy / 10
+                ]]);
+                const output = model.predict(input);
+                // Convert back from normalized 0-1 to actual screen pixels
+                return output.dataSync()[0] * canvas.width;
+            });
+        }
+
+        // --- 3. UI & MENU MANAGEMENT ---
+        function showAIPanel() {
+            document.getElementById('main-panel').classList.add('hidden');
+            document.getElementById('ai-panel').classList.remove('hidden');
+        }
+        function showMainPanel() {
+            document.getElementById('ai-panel').classList.add('hidden');
+            document.getElementById('main-panel').classList.remove('hidden');
+        }
+
+        function resetGameData() {
+            p1.score = 0; p2.score = 0;
+            document.getElementById('score1').innerText = 0;
+            document.getElementById('score2').innerText = 0;
+            p1.x = canvas.width / 2 - paddleWidth / 2;
+            p2.x = canvas.width / 2 - paddleWidth / 2;
+            resetBall();
+        }
+
+        function startHumanVsHuman() {
+            gameMode = 'pvh';
+            document.getElementById('menu').classList.add('hidden');
+            document.getElementById('p2-zone').classList.add('active'); // Enable Top Touch
+            resetGameData();
+            gameLoop();
+        }
+
+        function startAIvsHuman() {
+            if (!aiTrained) return;
+            gameMode = 'pva';
+            document.getElementById('menu').classList.add('hidden');
+            document.getElementById('p2-zone').classList.remove('active'); // Disable Top Touch
+            resetGameData();
+            gameLoop();
+        }
+
+        // --- 4. GAME ENGINE ---
+        function resetBall() {
+            ball.x = canvas.width / 2;
+            ball.y = canvas.height / 2;
+            ball.dy = ball.dy > 0 ? -initialBallSpeed : initialBallSpeed; 
+            ball.dx = (Math.random() > 0.5 ? 1 : -1) * (3 + Math.random() * 2);
+        }
+
+        let frameCount = 0;
+
+        function update() {
+            // Move Ball
+            ball.x += ball.dx;
+            ball.y += ball.dy;
+
+            // AI Logic updating
+            if (gameMode === 'pva') {
+                // We only run the neural net every 5 frames to save battery & prevent lag
+                if (frameCount % 5 === 0) {
+                    aiTargetX = getAIPrediction();
+                }
+                
+                // Smoothly slide AI paddle to the target X predicted by Neural Network
+                let targetPaddleX = aiTargetX - (p2.width / 2);
+                
+                // Keep AI in bounds
+                if (targetPaddleX < 0) targetPaddleX = 0;
+                if (targetPaddleX + p2.width > canvas.width) targetPaddleX = canvas.width - p2.width;
+
+                // Move paddle towards target (0.15 is the "reaction speed")
+                p2.x += (targetPaddleX - p2.x) * 0.15; 
+            }
+
+            // Ball collision with side walls
+            if (ball.x - ball.radius < 0 || ball.x + ball.radius > canvas.width) ball.dx = -ball.dx;
+
+            // Collision with Bottom Paddle (Human)
+            if (ball.y + ball.radius >= p1.y && ball.x >= p1.x && ball.x <= p1.x + p1.width && ball.dy > 0) {
+                ball.dy = -ball.dy * 1.05; 
+                ball.dx = (ball.x - (p1.x + p1.width / 2)) * 0.15; 
+            }
+
+            // Collision with Top Paddle (Human or AI)
+            if (ball.y - ball.radius <= p2.y + p2.height && ball.x >= p2.x && ball.x <= p2.x + p2.width && ball.dy < 0) {
+                ball.dy = -ball.dy * 1.05;
+                ball.dx = (ball.x - (p2.x + p2.width / 2)) * 0.15;
+            }
+
+            // Cap speeds
+            if (ball.dy > 14) ball.dy = 14; if (ball.dy < -14) ball.dy = -14;
+
+            // Scoring
+            if (ball.y < 0) {
+                p1.score++; document.getElementById('score1').innerText = p1.score; resetBall();
+            } else if (ball.y > canvas.height) {
+                p2.score++; document.getElementById('score2').innerText = p2.score; resetBall();
+            }
+            frameCount++;
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Center line
+            ctx.setLineDash([10, 15]); ctx.beginPath(); ctx.moveTo(0, canvas.height / 2);
+            ctx.lineTo(canvas.width, canvas.height / 2); ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
+            ctx.lineWidth = 2; ctx.stroke();
+
+            // Paddles
+            ctx.fillStyle = p1.color; ctx.beginPath(); ctx.roundRect(p1.x, p1.y, p1.width, p1.height, 8); ctx.fill();
+            ctx.fillStyle = p2.color; ctx.beginPath(); ctx.roundRect(p2.x, p2.y, p2.width, p2.height, 8); ctx.fill();
+
+            // Ball
+            ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
+            ctx.fillStyle = ball.color; ctx.fill(); ctx.closePath();
+        }
+
+        function gameLoop() {
+            update();
+            draw();
+            animationId = requestAnimationFrame(gameLoop);
+        }
+
+        // --- 5. TOUCH CONTROLS ---
+        function setupTouchSlider(zoneId, player) {
+            const zone = document.getElementById(zoneId);
+            let activeTouchId = null;
+
+            function handleTouch(e) {
+                e.preventDefault();
+                for (let i = 0; i < e.changedTouches.length; i++) {
+                    const touch = e.changedTouches[i];
+                    if (e.type === 'touchstart' && activeTouchId === null) activeTouchId = touch.identifier;
+                    if (touch.identifier === activeTouchId) {
+                        if (e.type === 'touchend' || e.type === 'touchcancel') {
+                            activeTouchId = null;
+                        } else {
+                            let newX = touch.clientX - player.width / 2;
+                            if (newX < 0) newX = 0;
+                            if (newX + player.width > canvas.width) newX = canvas.width - player.width;
+                            player.x = newX;
+                        }
+                    }
+                }
+            }
+            zone.addEventListener('touchstart', handleTouch, {passive: false});
+            zone.addEventListener('touchmove', handleTouch, {passive: false});
+            zone.addEventListener('touchend', handleTouch, {passive: false});
+            zone.addEventListener('touchcancel', handleTouch, {passive: false});
+        }
+
+        setupTouchSlider('p1-zone', p1);
+        setupTouchSlider('p2-zone', p2);
+    </script>
+</body>
+  </html>
+  
